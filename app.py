@@ -92,6 +92,8 @@ def portable_env():
     env['PATH'] = os.pathsep.join([magick_bin_dir, env.get('PATH', '')])
     lib_dir = os.path.join(MAGICK_DIR, 'lib')
     if os.path.isdir(lib_dir):
+        # Prepend ImageMagick lib dir to ensure it takes precedence over PIL bundled libs
+        # This fixes harfbuzz symbol conflicts between PIL and ImageMagick
         env['DYLD_LIBRARY_PATH'] = lib_dir + os.pathsep + env.get('DYLD_LIBRARY_PATH', '')
     return env
 

@@ -52,6 +52,9 @@ a = Analysis(
 )
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# Post-build: fix library references to prevent harfbuzz conflicts
+# This ensures magick binary uses the correct harfbuzz library
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -86,3 +89,22 @@ app = BUNDLE(
     icon='ImageConverter.icns',
     bundle_identifier='com.yourcompany.ImageConverter',  # Set your bundle identifier here if desired
 )
+
+# Post-build: Fix library paths for harfbuzz
+import subprocess
+import shutil
+app_path = os.path.join('dist', 'Image Converter.app')
+if os.path.exists(app_path):
+    frameworks_path = os.path.join(app_path, 'Contents', 'Frameworks')
+    
+    # Copy Homebrew's harfbuzz (with CoreText support) to portable_magick/lib
+    # where the magick binary expects to find it via @rpath
+    harfbuzz_dest = os.path.join(frameworks_path, 'portable_magick', 'lib', 'libharfbuzz.0.dylib')
+    harfbuzz_homebrew = '/opt/homebrew/lib/libharfbuzz.0.dylib'
+    
+    if os.path.exists(harfbuzz_homebrew):
+        # Ensure the lib directory exists
+        os.makedirs(os.path.dirname(harfbuzz_dest), exist_ok=True)
+        # Copy Homebrew's harfbuzz (has CoreText support that ImageMagick needs)
+        shutil.copy2(harfbuzz_homebrew, harfbuzz_dest)
+        print(f"Fixed harfbuzz: copied from {harfbuzz_homebrew} to {harfbuzz_dest}")
