@@ -1,0 +1,1494 @@
+"""
+Image Converter
+Copyright (c) 2026 Colin Parsons
+All Rights Reserved.
+
+This software was created and is owned by Colin Parsons.
+
+Inspired Thinking Group (ITG) colleagues are granted permission to use,
+modify, and share this application internally within the business.
+
+External distribution, publication, or sharing of this software is strictly
+prohibited without Colin Parsons' prior written permission.
+
+The software is provided "as-is" without any express or implied warranty.
+Neither the author nor Inspired Thinking Group shall be liable for any
+resulting damages.
+
+Version: 1.0.0
+"""
+
+
+import os
+
+# --- Ensure convert binary is executable in the bundle ---
+
+
+def ensure_convert_executable():
+    here = os.path.dirname(__file__)
+    paths = [
+        os.path.join(here, 'portable_magick', 'bin', 'convert'),
+        os.path.join(here, 'portable_magick', 'bin', 'convert', 'convert'),  # fallback for PyInstaller bug
+    ]
+    for bin_path in paths:
+        if os.path.exists(bin_path) and os.path.isfile(bin_path):
+            try:
+                os.chmod(bin_path, 0o755)
+            except Exception as e:
+                print(f"Warning: could not chmod {bin_path}: {e}")
+
+
+ensure_convert_executable()
+import subprocess
+import tempfile
+import shutil
+import math
+import sqlite3
+import time
+import pandas as pd
+import re
+from PyQt5.QtWidgets import QApplication, QMainWindow, QLineEdit, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton, QListWidget, QFileDialog, QLabel, QProgressBar, QWidget, QMessageBox
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QIcon, QPixmap, QMovie, QPainter
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtWidgets import QComboBox, QCheckBox, QAction, QDialog, QSpinBox, QTextEdit, QTabWidget
+from renamer import RenamerTab
+from qr_code import QRCodeTab
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# --- Portable tool integration ---
+import sys
+
+
+def resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller bundle."""
+    if hasattr(sys, '_MEIPASS'):
+        base_path = sys._MEIPASS
+    else:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+
+MAGICK_DIR = resource_path('portable_magick')
+
+
+def find_portable_magick_bin():
+    # Prefer 'magick' (IM v7) if present, fall back to 'convert' (IM v6)
+    for name in ('magick', 'convert'):
+        path = os.path.join(MAGICK_DIR, 'bin', name)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+# Resolve portable ImageMagick entry point
+MAGICK_BIN = find_portable_magick_bin()
+if not MAGICK_BIN:
+    raise FileNotFoundError("No usable ImageMagick binary ('magick' or 'convert') found in portable_magick/bin.")
+
+
+def portable_env():
+    env = os.environ.copy()
+    magick_bin_dir = os.path.join(MAGICK_DIR, 'bin')
+    env['PATH'] = os.pathsep.join([magick_bin_dir, env.get('PATH', '')])
+    lib_dir = os.path.join(MAGICK_DIR, 'lib')
+    if os.path.isdir(lib_dir):
+        env['DYLD_LIBRARY_PATH'] = lib_dir + os.pathsep + env.get('DYLD_LIBRARY_PATH', '')
+    return env
+
+    gs_path = os.path.join(magick_bin_dir, 'gs')
+    env['GS_PROG'] = gs_path
+    # If you have a modules directory, add:
+    # env['MAGICK_MODULE_PATH'] = os.path.join(MAGICK_DIR, 'lib', 'ImageMagick-7.*/modules-Q16HDRI/coders')
+    return env
+    return env
+
+
+# Debug prints for runtime path diagnostics
+print("[DEBUG] MAGICK_DIR:", MAGICK_DIR)
+print("[DEBUG] MAGICK_BIN:", MAGICK_BIN)
+print("[DEBUG] Current working dir:", os.getcwd())
+if hasattr(sys, '_MEIPASS'):
+    print("[DEBUG] Running from PyInstaller bundle, MEIPASS:", sys._MEIPASS)
+
+from animated_toggle import AnimatedToggle
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+#######################################################################################################
+# Get the base directory (where your main application file is located)
+basedir = os.path.dirname(__file__)
+
+#######################################################################################################
+
+
+def build_im_command(src_path, dst_path, out_fmt, quality=None, colors=None, scale=100, density=None,
+                     trim=False, gif_timing=None, magick_bin=MAGICK_BIN):
+    """Build an ImageMagick convert command using only portable_magick.
+    gif_timing: dict with keys {delay, loop} or fca/frame/opt/custom string use-case.
+    """
+    cmd = [magick_bin]
+    # PDF density must come before input
+    if density is not None:
+        cmd += ['-density', str(density)]
+
+    # For animated inputs, coalesce should occur AFTER the input is read.
+
+    # For PDFs, when trimming is requested, use the TrimBox on import
+    if trim and src_path.lower().endswith('.pdf'):
+        cmd += ['-define', 'pdf:use-trimbox=true']
+
+    # Input
+    cmd += [src_path]
+
+    if trim:
+        cmd += ['-trim', '+repage']
+
+    # Apply coalesce only when output is GIF and the input is an animated GIF
+    if out_fmt == 'gif' and src_path.lower().endswith('.gif'):
+        cmd += ['-coalesce']
+
+    # Common operations
+    if out_fmt == 'jpg':
+        if quality is not None:
+            cmd += ['-quality', str(quality)]
+        cmd += ['-strip', '-interlace', 'Plane', '-sampling-factor', '4:2:0']
+    elif out_fmt in ('png', 'gif'):
+        if colors is not None:
+            cmd += ['-dither', 'None', '-colors', str(colors)]
+        if out_fmt == 'png':
+            cmd += ['-strip', '-define', 'png:compression-level=9']
+        if out_fmt == 'gif':
+            cmd += ['-layers', 'Optimize', '+map']
+
+    if scale != 100:
+        cmd += ['-resize', f'{scale}%']
+
+    # GIF timing controls (only for GIF output)
+    if out_fmt == 'gif' and gif_timing:
+        if isinstance(gif_timing, str):
+            cmd += ['-delay'] + gif_timing.split()
+        else:
+            delay = gif_timing.get('delay')
+            loop = gif_timing.get('loop')
+            if delay is not None:
+                cmd += ['-delay', str(delay)]
+            if loop is not None:
+                cmd += ['-loop', str(loop)]
+
+    # Output
+    cmd += [dst_path]
+    return cmd
+
+
+def within_tolerance(size_bytes, target_bytes, tolerance_pct):
+    lo = target_bytes * (1 - tolerance_pct / 100.0)
+    hi = target_bytes * (1 + tolerance_pct / 100.0)
+    return lo <= size_bytes <= hi
+
+
+def convert_with_target(src_path, out_dir, out_fmt, target_bytes, tolerance_pct, trim_pdf,
+                        gif_opts, default_density=None, timeout_sec=25, magick_bin=MAGICK_BIN):
+    """Iteratively convert using ImageMagick only to meet byte target.
+    Returns (out_path, size_str) or raises on fatal error.
+    """
+    base_name = os.path.splitext(os.path.basename(src_path))[0]
+    dst_path = os.path.join(out_dir or os.path.dirname(src_path), f"{base_name}.{out_fmt}")
+    is_pdf = src_path.lower().endswith('.pdf')
+
+    # Default mode: if target_bytes is None, do a single-pass conversion with density 288 (for PDFs) and resize 25%
+    if target_bytes is None:
+        density = (default_density if default_density is not None else 288) if is_pdf else None
+        cmd = build_im_command(
+            src_path, dst_path, out_fmt,
+            quality=None, colors=None, scale=25, density=density,
+            trim=trim_pdf and is_pdf,
+            gif_timing=(gif_opts.get('custom') if gif_opts else None),
+            magick_bin=magick_bin,
+        )
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=portable_env())
+        if res.returncode != 0:
+            raise RuntimeError(f"Default conversion failed: {res.stderr.decode(errors='ignore')}")
+        out_choice = dst_path
+        if not os.path.exists(out_choice):
+            # Multi-page outputs may be written as base-0.ext, base-1.ext, etc.
+            base_no_ext, ext = os.path.splitext(dst_path)
+            import glob
+            candidates = sorted(glob.glob(f"{base_no_ext}-*{ext}"))
+            if candidates:
+                out_choice = candidates[0]
+            else:
+                raise RuntimeError("Default conversion failed: no output produced")
+        size = os.path.getsize(out_choice)
+        return out_choice, f"{size} Bytes ({size/1024:.2f} KB)"
+
+    work_dir = tempfile.mkdtemp(prefix="imconv_")
+    try:
+        start_ts = time.time()
+        # Optional pre-pass: for PDFs with a target, rasterize once at the selected preset density then apply tolerance on the raster
+        src_for_iter = src_path
+        if target_bytes is not None and is_pdf and default_density is not None:
+            pre_src = os.path.join(work_dir, f"pre_{default_density}.png")
+            pre_cmd = build_im_command(
+                src_path, pre_src, 'png', quality=None, colors=None, scale=25, density=default_density,
+                trim=trim_pdf and is_pdf, gif_timing=None, magick_bin=magick_bin
+            )
+            res = subprocess.run(pre_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=portable_env())
+            if res.returncode == 0 and os.path.exists(pre_src):
+                src_for_iter = pre_src
+                is_pdf = False  # subsequent steps treat it as an image (no PDF density needed)
+
+        # Strategy parameters
+        if is_pdf:
+            base_ladder = [200, 150, 120, 100]
+            if default_density is not None:
+                # Start with the user-selected preset, then fall back through the base ladder
+                density_ladder = [default_density] + [d for d in base_ladder if d != default_density]
+            else:
+                density_ladder = base_ladder
+        else:
+            density_ladder = [None]
+        scale_ladder = [100, 90, 80, 70, 60]
+        # Quality/palette search ranges
+        q_lo, q_hi = 20, 90
+        c_lo, c_hi = 16, 256
+
+        best_path = None
+        best_delta = float('inf')
+
+        for density in density_ladder:
+            for scale in scale_ladder:
+                # Initialize per-format parameter search
+                if out_fmt == 'jpg':
+                    lo, hi = q_lo, q_hi
+                    while lo <= hi:
+                        # Timeout: if target mode and taking too long, fall back to single pass using selected preset (or Low)
+                        if target_bytes is not None and (time.time() - start_ts) > timeout_sec:
+                            low_density = default_density if default_density is not None else (144 if src_path.lower().endswith('.pdf') else None)
+                            cmd = build_im_command(
+                                src_path, dst_path, out_fmt,
+                                quality=None, colors=None, scale=25, density=low_density,
+                                trim=trim_pdf and src_path.lower().endswith('.pdf'),
+                                gif_timing=None, magick_bin=magick_bin,
+                            )
+                            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=portable_env())
+                            if res.returncode != 0 or not os.path.exists(dst_path):
+                                raise RuntimeError(f"Timed fallback failed: {res.stderr.decode(errors='ignore')}")
+                            size = os.path.getsize(dst_path)
+                            return dst_path, f"{size} Bytes ({size/1024:.2f} KB) [Timed fallback]"
+                        mid = (lo + hi) // 2
+                        tmp_out = os.path.join(work_dir, f"tmp_{density}_{scale}_{mid}.jpg")
+                        cmd = build_im_command(
+                            src_for_iter, tmp_out, 'jpg', quality=mid, scale=scale, density=density,
+                            trim=trim_pdf and is_pdf, gif_timing=None, magick_bin=magick_bin
+                        )
+                        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=portable_env())
+                        if res.returncode != 0 or not os.path.exists(tmp_out):
+                            # On error, move quality lower to try smaller file
+                            hi = mid - 1
+                            continue
+                        size = os.path.getsize(tmp_out)
+                        if within_tolerance(size, target_bytes, tolerance_pct):
+                            shutil.move(tmp_out, dst_path)
+                            return dst_path, f"{size} Bytes ({size/1024:.2f} KB)"
+                        # Track best attempt
+                        delta = abs(size - target_bytes)
+                        if delta < best_delta:
+                            best_delta = delta
+                            best_path = tmp_out
+                        if size > target_bytes:
+                            # need smaller file => reduce quality
+                            hi = mid - 1
+                        else:
+                            lo = mid + 1
+
+                elif out_fmt in ('png', 'gif'):
+                    lo, hi = c_lo, c_hi
+                    while lo <= hi:
+                        # Timeout fallback
+                        if target_bytes is not None and (time.time() - start_ts) > timeout_sec:
+                            low_density = default_density if default_density is not None else (144 if src_path.lower().endswith('.pdf') else None)
+                            cmd = build_im_command(
+                                src_path, dst_path, out_fmt,
+                                quality=None, colors=None, scale=25, density=low_density,
+                                trim=trim_pdf and src_path.lower().endswith('.pdf'),
+                                gif_timing=None, magick_bin=magick_bin,
+                            )
+                            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=portable_env())
+                            if res.returncode != 0 or not os.path.exists(dst_path):
+                                raise RuntimeError(f"Timed fallback failed: {res.stderr.decode(errors='ignore')}")
+                            size = os.path.getsize(dst_path)
+                            return dst_path, f"{size} Bytes ({size/1024:.2f} KB) [Timed fallback]"
+                        mid = (lo + hi) // 2
+                        tmp_out = os.path.join(work_dir, f"tmp_{density}_{scale}_{mid}.{out_fmt}")
+                        timing = None
+                        if out_fmt == 'gif' and gif_opts:
+                            # Use existing custom timing string if provided
+                            timing = gif_opts.get('custom') or None
+                        cmd = build_im_command(
+                            src_for_iter, tmp_out, out_fmt, colors=mid, scale=scale, density=density,
+                            trim=trim_pdf and is_pdf, gif_timing=timing, magick_bin=magick_bin
+                        )
+                        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=portable_env())
+                        if res.returncode != 0 or not os.path.exists(tmp_out):
+                            # On error, reduce colors to get smaller files
+                            hi = mid - 1
+                            continue
+                        size = os.path.getsize(tmp_out)
+                        if within_tolerance(size, target_bytes, tolerance_pct):
+                            shutil.move(tmp_out, dst_path)
+                            return dst_path, f"{size} Bytes ({size/1024:.2f} KB)"
+                        delta = abs(size - target_bytes)
+                        if delta < best_delta:
+                            best_delta = delta
+                            best_path = tmp_out
+                        if size > target_bytes:
+                            hi = mid - 1
+                        else:
+                            lo = mid + 1
+
+        # If no exact match, write best attempt if any
+        if best_path and os.path.exists(best_path):
+            shutil.move(best_path, dst_path)
+            size = os.path.getsize(dst_path)
+            return dst_path, f"{size} Bytes ({size/1024:.2f} KB)"
+        raise RuntimeError("Conversion failed: no output produced")
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+class GenericConversionThread(QThread):
+    progress = pyqtSignal(str, int, int)
+    converted_created = pyqtSignal(str, str)
+
+    def __init__(self, files, output_dir, out_fmt, target_bytes, tolerance_pct, trim_pdfs,
+                 fca_value, frame_value, opt_value, custom_fca_frame_cmd, workers=5,
+                 default_density=None, timeout_sec=25):
+        super().__init__()
+        self.files = files
+        self.output_dir = output_dir
+        self.out_fmt = out_fmt
+        self.target_bytes = target_bytes
+        self.tolerance_pct = tolerance_pct
+        self.trim_pdfs = trim_pdfs
+        self.gif_opts = {
+            'fca': fca_value,
+            'frame': frame_value,
+            'opt': opt_value,
+            'custom': custom_fca_frame_cmd
+        }
+        self.workers = max(1, int(workers))
+        self.default_density = default_density
+        self.timeout_sec = timeout_sec
+
+    def run(self):
+        total_files = len(self.files)
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            future_to_src = {}
+            for f in self.files:
+                fut = executor.submit(
+                    convert_with_target,
+                    f,
+                    self.output_dir,
+                    self.out_fmt,
+                    self.target_bytes,
+                    self.tolerance_pct,
+                    self.trim_pdfs,
+                    self.gif_opts,
+                    self.default_density,
+                    timeout_sec=self.timeout_sec,
+                    magick_bin=MAGICK_BIN
+                )
+                future_to_src[fut] = f
+
+            total = len(future_to_src)
+            completed_index = 0
+            for future in as_completed(future_to_src):
+                try:
+                    out_path, size_str = future.result()
+                    src_path_orig = future_to_src[future]
+                    completed_index += 1
+                    # If ImageMagick produced multi-page outputs (e.g., name-0.jpg, name-1.jpg),
+                    # the returned out_path may be a single page (e.g., base-0.jpg). In that case,
+                    # glob using the stem without the trailing -<n> to capture both pages, but ONLY
+                    # when the original source was not already a numbered page file.
+                    emitted_any = False
+                    base, ext = os.path.splitext(out_path)
+                    import glob, re
+                    base_dir = os.path.dirname(base)
+                    base_name = os.path.basename(base)
+                    m = re.match(r"^(.*)-(\d+)$", base_name)
+                    src_is_numbered = re.match(r"^(.*)-(\d+)\.[^.]+$", os.path.basename(src_path_orig)) is not None
+                    if m and not src_is_numbered:
+                        base_for_glob = os.path.join(base_dir, m.group(1))
+                    else:
+                        base_for_glob = base
+                    # Gather candidates like base-<n>.ext
+                    pattern = f"{base_for_glob}-*.{ext.lstrip('.')}"
+                    candidates = sorted(glob.glob(pattern))
+                    if candidates:
+                        # Sort pages numerically; then if both 1 and 0 exist, place 1 before 0
+                        def page_index(p):
+                            b = os.path.splitext(os.path.basename(p))[0]
+                            try:
+                                return int(b.split('-')[-1])
+                            except Exception:
+                                return 0
+                        candidates.sort(key=page_index)
+                        # Reorder to prefer page 1 first if both 0 and 1 present
+                        names = {os.path.splitext(os.path.basename(c))[0] for c in candidates}
+                        has0 = any(n.endswith('-0') for n in names)
+                        has1 = any(n.endswith('-1') for n in names)
+                        if has0 and has1:
+                            candidates = sorted(
+                                candidates,
+                                key=lambda p: (
+                                    0, page_index(p)
+                                ) if p.endswith('-1'+ext) else (
+                                    1, page_index(p)
+                                ) if p.endswith('-0'+ext) else (
+                                    2, page_index(p)
+                                )
+                            )
+                        for p in candidates:
+                            try:
+                                sz = os.path.getsize(p)
+                                name = os.path.basename(p)
+                                self.progress.emit(name, completed_index, total)
+                                self.converted_created.emit(p, f"{sz} Bytes ({sz/1024:.2f} KB)")
+                                emitted_any = True
+                            except Exception:
+                                continue
+                    if not emitted_any:
+                        # Single output
+                        name = os.path.basename(out_path)
+                        self.progress.emit(name, completed_index, total)
+                        self.converted_created.emit(out_path, size_str)
+                except Exception as e:
+                    print(f"Error converting {future_to_src[future]}: {e}")
+
+# Define the name of your database file
+db_file = 'database.db'  # You can choose any name you like
+
+# Create the 'config' directory path
+config_dir = os.path.join(basedir, 'config')
+
+# Ensure the 'config' directory exists; create it if it does not
+os.makedirs(config_dir, exist_ok=True)
+
+# Create the full path to the database file inside the 'config' directory
+path_db = os.path.join(config_dir, db_file)
+
+# Now connect to the SQLite database
+try:
+    # Connect to the SQLite database (this will create the database file if it doesn't exist)
+    conn = sqlite3.connect(path_db)
+    # print(f"Successfully connected to the database at: {path_db}")
+
+    # Create a cursor object to execute SQL commands
+    cursor = conn.cursor()
+
+    # Create the tables if they don't already exist
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS paths (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT UNIQUE,  -- This will store either 'convert_path' or 'gifsicle_path'
+            path TEXT          -- This will store the actual path
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    # Optional: Insert default values if they don't exist
+    # Paths are now hardcoded to portable_magick, so DB values are ignored
+
+    # Commit changes and close the connection
+    conn.commit()
+
+except sqlite3.OperationalError as e:
+    print(f"Error connecting to the database: {e}")
+finally:
+    if conn:
+        conn.close()  # Always close the connection
+
+
+def convert_pdf_to_gif(pdf_path, output_dir, fca_value, frame_value, opt_value, magick_path, custom_fca_frame_cmd=None):
+    # Get the PDF name and the directory to save the GIF in
+    pdf_name = os.path.basename(pdf_path)  # Get the PDF filename
+    pdf_dir = os.path.dirname(pdf_path)
+    gif_name = pdf_name.replace('.pdf', '.gif')  # Create the GIF name
+    gif_path = os.path.join(pdf_dir, gif_name)  # Save GIF in the same directory as the PDF
+
+    # Determine the FCA and Frame part of the command
+    if custom_fca_frame_cmd:
+        fca_frame_cmd = custom_fca_frame_cmd  # Use the custom value if provided
+    else:
+        # Construct the FCA and Frame part of the command
+        if fca_value == "Yes" and frame_value == "Loop":
+            fca_frame_cmd = "300 -loop 0"
+        elif fca_value == "No" and frame_value == "Loop":
+            fca_frame_cmd = "300 -loop 0"
+        elif fca_value == "Yes" and frame_value == "2":
+            fca_frame_cmd = "1000 -loop 1"
+        elif fca_value == "No" and frame_value == "2":
+            fca_frame_cmd = "200 -loop 5"
+        elif fca_value == "Yes" and frame_value == "3":
+            fca_frame_cmd = "500 -loop 1"
+        elif fca_value == "No" and frame_value == "3":
+            fca_frame_cmd = "200 -loop 4"
+        elif fca_value == "Yes" and frame_value == "4":
+            fca_frame_cmd = "350 -loop 1"
+        elif fca_value == "No" and frame_value == "4":
+            fca_frame_cmd = "200 -loop 3"
+        elif fca_value == "Yes" and frame_value == "5":
+            fca_frame_cmd = "250 -loop 1"
+        elif fca_value == "No" and frame_value == "5":
+            fca_frame_cmd = "166 -loop 3"
+        elif fca_value == "Yes" and frame_value == "6":
+            fca_frame_cmd = "250 -loop 1"
+        elif fca_value == "No" and frame_value == "6":
+            fca_frame_cmd = "150 -loop 3"
+        elif fca_value == "Yes" and frame_value == "7":
+            fca_frame_cmd = "220 -loop 1"
+        elif fca_value == "No" and frame_value == "7":
+            fca_frame_cmd = "140 -loop 3"
+        elif fca_value == "Yes" and frame_value == "8":
+            fca_frame_cmd = "220 -loop 1"
+        elif fca_value == "No" and frame_value == "8":
+            fca_frame_cmd = "166 -loop 2"
+        elif fca_value == "Yes" and frame_value == "9":
+            fca_frame_cmd = "220 -loop 1"
+        elif fca_value == "No" and frame_value == "9":
+            fca_frame_cmd = "150 -loop 2"
+        else:
+            fca_frame_cmd = "-delay 500 -loop 0"  # Default command if no match
+
+    opt_cmd = "-layers Optimize" if opt_value == "Yes" else ""
+    opt_cmd1 = "-coalesce -dispose background -alpha background +dither"
+    opt_cmd2 = "+map -scale 25% +set comment"
+
+    # Use portable_magick binaries for conversion
+    if os.path.basename(magick_path) == 'magick':
+        cmd = [magick_path, 'convert', '-density', '288', '-delay']
+    else:
+        cmd = [magick_path, '-density', '288', '-delay']
+    cmd += fca_frame_cmd.split() + opt_cmd1.split() + (opt_cmd.split() if opt_cmd else []) + opt_cmd2.split()
+    cmd += [pdf_path, gif_path]
+
+    # Run the command with portable environment
+    convert_result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=portable_env())
+    print("Convert STDOUT:", convert_result.stdout.decode())
+    print("Convert STDERR:", convert_result.stderr.decode())
+    print("ImageMagick Command:", cmd)
+    if convert_result.returncode != 0:
+        print("ERROR: ImageMagick convert failed!")
+        if not os.path.exists(gif_path):
+            print(f"ERROR: Expected GIF not created at {gif_path}")
+            return 0  # or handle error appropriately
+
+    # Optional gifsicle pass is disabled to keep only portable ImageMagick usage
+
+    # Get the exact size of the GIF in bytes, with existence check
+    if not os.path.exists(gif_path):
+        print(f"ERROR: Final GIF not found at {gif_path}")
+        return 0
+    gif_size_bytes = os.path.getsize(gif_path)
+
+    # Convert to KB with two decimal places
+    gif_size_kb = gif_size_bytes / 1024
+
+    # Return details
+    return pdf_name, gif_path, f"{gif_size_bytes} Bytes ({gif_size_kb:.2f} KB)"
+
+
+#######################################################################################################
+
+
+class ConversionThread(QThread):
+    progress = pyqtSignal(str, int, int)  # Signal to update progress: pdf name, current, total count
+    gif_created = pyqtSignal(str, str)  # Signal to notify GIF creation: gif name, size
+
+    def __init__(self, pdf_list, output_dir, fca_value, frame_value, opt_value, convert_path, custom_fca_frame_cmd=None):
+        super().__init__()
+        self.pdf_list = pdf_list
+        self.output_dir = output_dir
+        self.fca_value = fca_value
+        self.frame_value = frame_value
+        self.opt_value = opt_value
+        self.convert_path = convert_path  # Use user-defined path
+        self.custom_fca_frame_cmd = custom_fca_frame_cmd
+
+    def run(self):
+        total_files = len(self.pdf_list)
+
+        # Use ThreadPoolExecutor to limit concurrency to 3
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            # Submit each PDF conversion task
+            futures = [
+                executor.submit(
+                    convert_pdf_to_gif,
+                    pdf_path,
+                    self.output_dir,
+                    self.fca_value,
+                    self.frame_value,
+                    self.opt_value,
+                    MAGICK_BIN,
+                    custom_fca_frame_cmd=self.custom_fca_frame_cmd
+                )
+                for pdf_path in self.pdf_list
+            ]
+
+            # Process each completed future as it finishes
+            for idx, future in enumerate(as_completed(futures)):
+                try:
+                    pdf_name, gif_path, gif_size = future.result()
+                    # Emit progress and completion signals
+                    self.progress.emit(pdf_name, idx + 1, total_files)
+                    self.gif_created.emit(gif_path, gif_size)
+                except Exception as e:
+                    print(f"Error processing {self.pdf_list[idx]}: {e}")
+
+#######################################################################################################
+
+
+# Removed CompressionThread and gifsicle-based optimization
+
+#######################################################################################################
+
+
+class GifWindow(QWidget):
+    def __init__(self, gif_path):
+        super().__init__()
+
+        self.setWindowTitle(os.path.basename(gif_path))
+
+        # Load the GIF as a QMovie
+        self.movie = QMovie(gif_path)
+
+        gif_size = self.movie.scaledSize()  # Get size of the GIF
+        if not gif_size.isEmpty():
+            self.setGeometry(100, 100, gif_size.width(), gif_size.height())
+
+        # Create layout
+        layout = QVBoxLayout()
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        # QLabel to show the GIF
+        self.gif_label = QLabel(self)
+        layout.addWidget(self.gif_label)
+
+        # Load the GIF into the QLabel
+        self.movie = QMovie(gif_path)
+        self.gif_label.setMovie(self.movie)
+        self.movie.start()
+
+        # Set the layout for the window
+        self.setLayout(layout)
+
+#######################################################################################################
+
+
+class PDFToGIFOptimizer(QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        # Menus with macOS menu roles so items appear in the standard locations
+        menubar = self.menuBar()
+        app_menu = menubar.addMenu("Image Converter")
+        help_menu = menubar.addMenu("Help")
+
+        about_action = QAction("About Image Converter…", self)
+        about_action.setMenuRole(QAction.AboutRole)
+        about_action.triggered.connect(self.show_about)
+        # Show under Help, macOS will also place it in the app menu automatically
+        help_menu.addAction(about_action)
+
+        help_menu.addSeparator()
+
+        # Licenses submenu
+        licenses_menu = help_menu.addMenu("Licenses")
+        im_license_action = QAction("ImageMagick License…", self)
+        im_license_action.triggered.connect(self.show_imagemagick_license)
+        licenses_menu.addAction(im_license_action)
+        gs_license_action = QAction("Ghostscript License (AGPL)…", self)
+        gs_license_action.triggered.connect(self.show_ghostscript_license)
+        licenses_menu.addAction(gs_license_action)
+
+        # File menu with Settings
+        file_menu = menubar.addMenu("File")
+        settings_action = QAction("Settings…", self)
+        settings_action.triggered.connect(self.open_settings)
+        file_menu.addAction(settings_action)
+
+        app_menu.addSeparator()
+        quit_action = QAction("Quit Image Converter", self)
+        quit_action.setMenuRole(QAction.QuitRole)
+        quit_action.triggered.connect(QApplication.instance().quit)
+        app_menu.addAction(quit_action)
+
+        self.convert_path = MAGICK_BIN
+        # gifsicle removed
+
+        # Load persisted settings before building controls
+        self.default_settings = self.load_settings_from_db()
+
+        # Add this flag
+        self.gif_window_opened = False
+
+        # Build UI
+        self.setWindowTitle("Image Converter")
+        self.setGeometry(100, 100, 800, 600)
+        # Set a window icon if available
+        try:
+            icon_dir = os.path.join(basedir, "icons")
+            icon_candidates = [
+                "app.png",
+                "image.png",
+                "convert.png",
+                "pdf.png",
+            ]
+            for name in icon_candidates:
+                p = os.path.join(icon_dir, name)
+                if os.path.exists(p):
+                    self.setWindowIcon(QIcon(p))
+                    break
+        except Exception:
+            pass
+
+        # Create tab widget
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+
+        # Image tab
+        image_tab = QWidget()
+        image_layout = QVBoxLayout()
+        image_layout.setContentsMargins(12, 12, 12, 12)
+        image_layout.setSpacing(10)
+
+        # Instruction label
+        self.label = QLabel("Select Folder with PDF/JPG/PNG/GIF:")
+        image_layout.addWidget(self.label)
+
+        # File list
+        self.file_list_widget = QListWidget()
+        self.file_list_widget.setSelectionMode(self.file_list_widget.ExtendedSelection)
+        self.file_list_widget.installEventFilter(self)
+        image_layout.addWidget(self.file_list_widget)
+
+        # Top action bar
+        topbutton_layout = QHBoxLayout()
+        topbutton_layout.setSpacing(8)
+
+        self.select_button = QPushButton("Select Folder")
+        self.select_button.setIcon(QIcon(os.path.join(basedir, "icons", "add.png")))
+        self.select_button.clicked.connect(self.select_folder)
+        topbutton_layout.addWidget(self.select_button)
+
+        self.clear_button = QPushButton("Clear List")
+        self.clear_button.setIcon(QIcon(os.path.join(basedir, "icons", "delete.png")))
+        self.clear_button.clicked.connect(self.clear_list)
+        topbutton_layout.addWidget(self.clear_button)
+
+        # Remove selected items button ("<->")
+        self.remove_button = QPushButton("<-> Remove Selected")
+        self.remove_button.clicked.connect(self.remove_selected)
+        topbutton_layout.addWidget(self.remove_button)
+
+        self.progress_bar = QProgressBar()
+        topbutton_layout.addWidget(self.progress_bar)
+
+        # Workers control
+        topbutton_layout.addWidget(QLabel("Workers"))
+        self.workers_spin = QSpinBox()
+        self.workers_spin.setRange(1, 16)
+        try:
+            cores = os.cpu_count() or 5
+        except Exception:
+            cores = 5
+        default_workers = int(self.default_settings.get('workers', min(5, cores)))
+        self.workers_spin.setValue(default_workers)
+        topbutton_layout.addWidget(self.workers_spin)
+
+        image_layout.addLayout(topbutton_layout)
+
+        # Conversion controls (aligned with equal spacing)
+        controls_layout = QGridLayout()
+        controls_layout.setHorizontalSpacing(12)
+        controls_layout.setVerticalSpacing(6)
+
+        row = 0
+        self.output_fmt_label = QLabel("Output:")
+        self.output_fmt_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        controls_layout.addWidget(self.output_fmt_label, row, 0)
+
+        self.output_format_combo = QComboBox()
+        self.output_format_combo.addItems(["JPG", "PNG", "GIF"])
+        if self.default_settings.get('output'):
+            self.output_format_combo.setCurrentText(self.default_settings['output'])
+        controls_layout.addWidget(self.output_format_combo, row, 1)
+
+        self.target_bytes_input = QLineEdit()
+        self.target_bytes_input.setPlaceholderText("Target KB")
+        self.target_bytes_input.setFixedWidth(120)
+        if self.default_settings.get('default_target_kb'):
+            self.target_bytes_input.setText(self.default_settings['default_target_kb'])
+        controls_layout.addWidget(self.target_bytes_input, row, 2)
+
+        # Resolution preset
+        self.res_label = QLabel("Res:")
+        self.res_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        controls_layout.addWidget(self.res_label, row, 3)
+
+        self.res_combo = QComboBox()
+        self.res_combo.addItems(["High", "Medium", "Low"])  # High=288, Medium=216, Low=144
+        self.res_combo.setCurrentText(self.default_settings.get('res', "High"))
+        controls_layout.addWidget(self.res_combo, row, 4)
+
+        self.tol_label = QLabel("Tol %:")
+        self.tol_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        controls_layout.addWidget(self.tol_label, row, 5)
+
+        self.tolerance_combo = QComboBox()
+        self.tolerance_combo.addItems(["5", "7", "10", "15"])  # simple chooser
+        self.tolerance_combo.setCurrentText(self.default_settings.get('tol', "10"))
+        controls_layout.addWidget(self.tolerance_combo, row, 6)
+
+        self.trim_checkbox = QCheckBox("Trim PDFs")
+        if self.default_settings.get('trim_pdfs') in ('1', 'true', 'True'):
+            self.trim_checkbox.setChecked(True)
+        controls_layout.addWidget(self.trim_checkbox, row, 7)
+
+        # Spacer to push the process button to the right
+        controls_layout.setColumnStretch(8, 1)
+
+        self.process_button = QPushButton("Process Files")
+        self.process_button.setIcon(QIcon(os.path.join(basedir, "icons", "pdf.png")))
+        self.process_button.clicked.connect(self.process_files)
+        controls_layout.addWidget(self.process_button, row, 9)
+
+        image_layout.addLayout(controls_layout)
+        image_tab.setLayout(image_layout)
+        self.tabs.addTab(image_tab, "Image")
+
+        # Rename tab
+        self.renamer_tab = RenamerTab(path_db)
+        self.tabs.addTab(self.renamer_tab, "Rename")
+
+        # QR Code tab
+        self.qr_tab = QRCodeTab(path_db)
+        self.tabs.addTab(self.qr_tab, "QR Code")
+
+        # Enable drag and drop
+        self.setAcceptDrops(True)
+
+        self.setCentralWidget(self.tabs)
+
+        # Basic state
+        self.file_paths = []
+        self.output_dir = ""
+        self.processing = False
+        # Timeout seconds persisted
+        try:
+            self.custom_timeout_sec = int(self.default_settings.get('timeout_sec', 25))
+        except Exception:
+            self.custom_timeout_sec = 25
+
+    def set_controls_enabled(self, enabled: bool):
+        # Top bar controls
+        self.select_button.setEnabled(enabled)
+        self.clear_button.setEnabled(enabled)
+        self.remove_button.setEnabled(enabled)
+        self.workers_spin.setEnabled(enabled)
+        # Bottom controls
+        self.output_format_combo.setEnabled(enabled)
+        self.target_bytes_input.setEnabled(enabled)
+        self.res_combo.setEnabled(enabled)
+        self.tolerance_combo.setEnabled(enabled)
+        self.trim_checkbox.setEnabled(enabled)
+        self.process_button.setEnabled(enabled)
+
+    def eventFilter(self, obj, event):
+        # Allow Delete/Backspace to remove selected items from the list
+        if obj is self.file_list_widget and event.type() == event.KeyPress:
+            if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+                self.remove_selected()
+                return True
+        return super().eventFilter(obj, event)
+
+    def remove_selected(self):
+        """Remove only the selected file(s) from the list and internal state."""
+        items = self.file_list_widget.selectedItems()
+        if not items:
+            return
+        for item in items:
+            # Item text may contain " - <size>" suffix after processing
+            txt = item.text()
+            path = txt.split(" - ", 1)[0]
+            # Remove from widget
+            row = self.file_list_widget.row(item)
+            self.file_list_widget.takeItem(row)
+            # Remove from internal list
+            try:
+                self.file_paths.remove(path)
+            except ValueError:
+                pass
+
+    def auto_sort_list(self):
+        """Sort the list items alphabetically by filename (case-insensitive) and keep internal state in sync."""
+        items = []
+        for i in range(self.file_list_widget.count()):
+            it = self.file_list_widget.item(i)
+            items.append(it.text())
+        # Sort by basename of the path part (before size suffix), case-insensitive
+        def sort_key(s: str):
+            path_part = s.split(" - ", 1)[0]
+            return os.path.basename(path_part).lower()
+        items.sort(key=sort_key)
+        self.file_list_widget.clear()
+        self.file_list_widget.addItems(items)
+        # Sync internal state with visible list
+        self.file_paths = self._current_list_paths()
+
+#######################################################################################################
+
+    def load_paths_from_db(self):
+        """Load convert path from portable bundle (DB ignored)."""
+        self.convert_path = MAGICK_BIN
+        print(f"Convert Path Loaded: {MAGICK_BIN}")
+
+#######################################################################################################
+
+    # THIS IS TO SWITCH OFF DRAG AND DROP HAVE PATH ISSUES WITH RESIZED FOLDER
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        # Close the GIF window if it's open
+        if hasattr(self, 'gif_window') and self.gif_window.isVisible():
+            self.gif_window.close()
+
+        # Reset the flag so the first GIF window will open again for the next batch
+        self.gif_window_opened = False
+
+        # Initialize self.file_paths if not already done
+        if not hasattr(self, 'file_paths'):
+            self.file_paths = []
+
+        # Handle dropped files/URLs
+        for url in event.mimeData().urls():
+            file_path = url.toLocalFile()
+            if file_path.endswith(('.pdf', '.gif', '.jpg', '.jpeg', '.png')):
+                # Replace spaces in file name with hyphens
+                filename = os.path.basename(file_path)
+                new_filename = filename.replace(" ", "-")
+                new_file_path = os.path.join(os.path.dirname(file_path), new_filename)
+
+                # Rename the file if needed
+                if file_path != new_file_path:
+                    os.rename(file_path, new_file_path)
+                    file_path = new_file_path  # Update to the renamed path
+
+                # Check if the file is already in file_paths
+                if file_path in self.file_paths:
+                    # Find the item in file_list_widget and update it
+                    items = self.file_list_widget.findItems(file_path, Qt.MatchExactly)
+                    if items:
+                        items[0].setText(file_path)  # Update existing item text if necessary
+                else:
+                    # Add new item if it doesn’t exist in the list
+                    self.file_list_widget.addItem(file_path)
+                    self.file_paths.append(file_path)
+
+    def on_processing_finished(self):
+        self.processing = False
+        self.set_controls_enabled(True)
+        # Ensure progress bar and status are coherent
+        self.progress_bar.reset()
+        if self.file_list_widget.count() == 0:
+            self.label.setText("Select Folder with PDF/JPG/PNG/GIF:")
+        else:
+            self.label.setText("Processing complete! You can clear list.")
+        # Auto-sort list by filename after processing
+        self.auto_sort_list()
+
+#######################################################################################################
+
+    def load_paths_from_db(self):
+        """Load paths from the database when the application starts."""
+        conn = sqlite3.connect(path_db)
+        cursor = conn.cursor()
+
+        # Fetch convert_path from the database
+        cursor.execute("SELECT path FROM paths WHERE type = 'convert_path'")
+        result = cursor.fetchone()
+        self.convert_path = result[0] if result else ""
+
+        conn.close()
+        print(f"Convert Path Loaded: {MAGICK_BIN}")
+
+    def load_settings_from_db(self):
+        """Read persisted settings if present and return as a dict."""
+        out = {}
+        try:
+            conn = sqlite3.connect(path_db)
+            cur = conn.cursor()
+            cur.execute("SELECT key, value FROM settings")
+            for k, v in cur.fetchall():
+                out[k] = v
+            conn.close()
+        except Exception:
+            pass
+        return out
+
+    def open_settings(self):
+        """Open a minimal settings dialog to adjust defaults for Output, Res, Tol%, Workers, Timeout."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Settings")
+        v = QVBoxLayout(dlg)
+
+        # Output format
+        out_row = QHBoxLayout()
+        out_row.addWidget(QLabel("Output:"))
+        out_combo = QComboBox()
+        out_combo.addItems(["JPG", "PNG", "GIF"])
+        out_combo.setCurrentText(self.output_format_combo.currentText())
+        out_row.addWidget(out_combo)
+        v.addLayout(out_row)
+
+        # Resolution preset
+        res_row = QHBoxLayout()
+        res_row.addWidget(QLabel("Res:"))
+        res_combo = QComboBox()
+        res_combo.addItems(["High", "Medium", "Low"])  # High=288, Medium=216, Low=144
+        res_combo.setCurrentText(self.res_combo.currentText())
+        res_row.addWidget(res_combo)
+        v.addLayout(res_row)
+
+        # Tolerance
+        tol_row = QHBoxLayout()
+        tol_row.addWidget(QLabel("Tol %:"))
+        tol_combo = QComboBox()
+        tol_combo.addItems(["5", "7", "10", "15"])
+        tol_combo.setCurrentText(self.tolerance_combo.currentText())
+        tol_row.addWidget(tol_combo)
+        v.addLayout(tol_row)
+
+        # Default Target KB
+        target_row = QHBoxLayout()
+        target_row.addWidget(QLabel("Default Target KB:"))
+        target_edit = QLineEdit()
+        target_edit.setPlaceholderText("Target KB")
+        target_edit.setFixedWidth(120)
+        # Prefer current UI value if present, else saved value
+        cur_target = self.target_bytes_input.text().strip() or self.default_settings.get('default_target_kb', '')
+        target_edit.setText(cur_target)
+        target_row.addWidget(target_edit)
+        v.addLayout(target_row)
+
+        # Trim PDFs default
+        trim_row = QHBoxLayout()
+        trim_checkbox = QCheckBox("Trim PDFs (default)")
+        trim_checkbox.setChecked(self.trim_checkbox.isChecked())
+        trim_row.addWidget(trim_checkbox)
+        v.addLayout(trim_row)
+
+        # Workers
+        workers_row = QHBoxLayout()
+        workers_row.addWidget(QLabel("Workers:"))
+        workers_spin = QSpinBox()
+        workers_spin.setRange(1, 16)
+        workers_spin.setValue(self.workers_spin.value())
+        workers_row.addWidget(workers_spin)
+        v.addLayout(workers_row)
+
+        # Timeout seconds
+        timeout_row = QHBoxLayout()
+        timeout_row.addWidget(QLabel("Timeout (sec):"))
+        timeout_spin = QSpinBox()
+        timeout_spin.setRange(5, 120)
+        timeout_spin.setValue(self.custom_timeout_sec)
+        timeout_row.addWidget(timeout_spin)
+        v.addLayout(timeout_row)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        reset_btn = QPushButton("Reset")
+        cancel_btn = QPushButton("Cancel")
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(reset_btn)
+        btn_row.addWidget(cancel_btn)
+        v.addLayout(btn_row)
+
+        def apply_and_close():
+            # Persist into main controls so next run uses these defaults
+            self.output_format_combo.setCurrentText(out_combo.currentText())
+            self.res_combo.setCurrentText(res_combo.currentText())
+            self.tolerance_combo.setCurrentText(tol_combo.currentText())
+            self.target_bytes_input.setText(target_edit.text().strip())
+            self.trim_checkbox.setChecked(trim_checkbox.isChecked())
+            self.workers_spin.setValue(workers_spin.value())
+            # Save timeout on instance for next GenericConversionThread
+            self.custom_timeout_sec = timeout_spin.value()
+            # Persist to DB
+            self.save_setting('output', out_combo.currentText())
+            self.save_setting('res', res_combo.currentText())
+            self.save_setting('tol', tol_combo.currentText())
+            self.save_setting('default_target_kb', target_edit.text().strip())
+            self.save_setting('trim_pdfs', '1' if trim_checkbox.isChecked() else '0')
+            self.save_setting('workers', str(workers_spin.value()))
+            self.save_setting('timeout_sec', str(self.custom_timeout_sec))
+            dlg.accept()
+
+        ok_btn.clicked.connect(apply_and_close)
+        
+        def reset_to_defaults():
+            # Standard defaults used before Settings existed
+            default_output = "JPG"
+            default_res = "High"  # 288 dpi
+            default_tol = "10"
+            try:
+                cores = os.cpu_count() or 5
+            except Exception:
+                cores = 5
+            default_workers = min(5, cores)
+            default_timeout = 25
+            # Apply to dialog widgets
+            out_combo.setCurrentText(default_output)
+            res_combo.setCurrentText(default_res)
+            tol_combo.setCurrentText(default_tol)
+            workers_spin.setValue(default_workers)
+            timeout_spin.setValue(default_timeout)
+            target_edit.setText("")
+            trim_checkbox.setChecked(False)
+            # Also apply to main UI immediately
+            self.output_format_combo.setCurrentText(default_output)
+            self.res_combo.setCurrentText(default_res)
+            self.tolerance_combo.setCurrentText(default_tol)
+            self.workers_spin.setValue(default_workers)
+            self.custom_timeout_sec = default_timeout
+            self.target_bytes_input.setText("")
+            self.trim_checkbox.setChecked(False)
+            # Persist to DB
+            self.save_setting('output', default_output)
+            self.save_setting('res', default_res)
+            self.save_setting('tol', default_tol)
+            self.save_setting('workers', str(default_workers))
+            self.save_setting('timeout_sec', str(default_timeout))
+            self.save_setting('default_target_kb', "")
+            self.save_setting('trim_pdfs', '0')
+
+        reset_btn.clicked.connect(reset_to_defaults)
+        cancel_btn.clicked.connect(dlg.reject)
+
+        dlg.exec_()
+
+    def save_setting(self, key: str, value: str):
+        try:
+            conn = sqlite3.connect(path_db)
+            cur = conn.cursor()
+            cur.execute("INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+    def update_convert_path(self, new_path):
+        """Update the convert_path attribute when changed in the dialog."""
+        self.convert_path = new_path
+
+    def update_gifsicle_path(self, new_path):
+        """Update the gifsicle_path attribute when changed in the dialog."""
+        self.gifsicle_path = new_path
+
+    def select_folder(self):
+        # Close the GIF window if it's open
+        if hasattr(self, 'gif_window') and self.gif_window.isVisible():
+            self.gif_window.close()
+
+        # Reset the flag so the first GIF window will open again for the next batch
+        self.gif_window_opened = False
+
+        # Open folder selection dialog
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder", os.path.expanduser("~/Desktop"))
+        if folder:
+            self.output_dir = folder
+            self.file_paths = []
+
+            # Iterate over each file in the selected folder
+            for f in os.listdir(folder):
+                if f.endswith(('.pdf', '.gif', '.jpg', '.jpeg', '.png')):
+                    # Define the original and new paths
+                    original_path = os.path.join(folder, f)
+                    new_filename = f.replace(" ", "-")  # Replace spaces with hyphens
+                    new_path = os.path.join(folder, new_filename)
+
+                    # Rename the file if it contains spaces
+                    if original_path != new_path:
+                        os.rename(original_path, new_path)
+
+                    # Add the renamed (or original) file path to the list
+                    self.file_paths.append(new_path)
+
+            # Clear and update the file list widget with renamed paths
+            self.file_list_widget.clear()
+            self.file_list_widget.addItems(self.file_paths)
+
+#######################################################################################################
+
+    def _current_list_paths(self):
+        paths = []
+        for i in range(self.file_list_widget.count()):
+            txt = self.file_list_widget.item(i).text()
+            base = txt.split(" - ", 1)[0]
+            paths.append(base)
+        return paths
+
+    def process_files(self):
+        # Prevent concurrent runs
+        if self.processing:
+            return
+
+        self.load_paths_from_db()
+        # Always derive the processing list from the visible UI list to avoid re-adding removed entries
+        current_paths = self._current_list_paths()
+        self.file_paths = current_paths[:]  # keep internal state in sync
+        files = [f for f in current_paths if f.lower().endswith(('.pdf', '.gif', '.jpg', '.jpeg', '.png'))]
+        if not files:
+            QMessageBox.warning(self, "No Files Found", "Please add PDF/JPG/PNG/GIF files to convert.")
+            return
+
+        # Always process all files; concurrency handled inside the worker thread (5 parallel tasks)
+
+        out_fmt = self.output_format_combo.currentText().lower()
+        target_txt = self.target_bytes_input.text().strip()
+        # Allow empty target to trigger default behavior (density 288 for PDFs, resize 25%)
+        if target_txt == "":
+            target_bytes = None
+        else:
+            if not target_txt.isdigit():
+                QMessageBox.warning(self, "Invalid Target", "Please enter a valid number of KB for the target size or leave blank for default.")
+                return
+            # Convert KB to bytes
+            target_bytes = int(target_txt) * 1024
+        tolerance = int(self.tolerance_combo.currentText())
+        trim_pdfs = self.trim_checkbox.isChecked()
+
+        # Map resolution preset to default PDF density for default mode
+        res_choice = self.res_combo.currentText()
+        if res_choice == "High":
+            default_density = 288
+        elif res_choice == "Medium":
+            default_density = 216
+        else:
+            default_density = 144
+
+        # No custom GIF timing; removed controls
+        fca_value = None
+        frame_value = None
+        opt_value = None
+        custom_fca_frame_cmd = None
+
+        # Passed validation; mark processing and disable controls
+        self.processing = True
+        self.set_controls_enabled(False)
+        self.progress_bar.setMaximum(len(files))
+        # Save outputs next to originals by passing None for output_dir
+        self.generic_thread = GenericConversionThread(
+            files, None, out_fmt, target_bytes, tolerance,
+            trim_pdfs, fca_value, frame_value, opt_value, custom_fca_frame_cmd,
+            workers=self.workers_spin.value(),
+            default_density=default_density,
+            timeout_sec=getattr(self, 'custom_timeout_sec', 25)
+        )
+        self.generic_thread.progress.connect(self.update_progress)
+        self.generic_thread.converted_created.connect(self.update_file_list)
+        self.generic_thread.finished.connect(self.on_processing_finished)
+        self.generic_thread.start()
+
+    def show_first_gif_window(self, gif_path, gif_size):
+        """Open a new window to display the first created GIF only once."""
+        if not self.gif_window_opened:
+            # Open the new window and display the GIF
+            self.gif_window = GifWindow(gif_path)
+            self.gif_window.show()
+
+            # Set the flag to True, so we don't open the window again
+            self.gif_window_opened = True
+
+    def show_about(self):
+        text = (
+            "Image Converter\n\n"
+            "A portable PyQt5 app that converts PDF/JPG/PNG/GIF to JPG/PNG/GIF using a bundled ImageMagick.\n\n"
+            "This application is for internal company use only.\n\n"
+            "Features:\n"
+            " • Target size with tolerance\n"
+            " • Multi-page PDF handling.\n"
+            " • Trim PDFs option and resolution presets\n"
+            " • Parallel processing with progress updates\n\n"
+            "Copyright © 2026 Colin Parsons"
+        )
+        QMessageBox.about(self, "About Image Converter", text)
+
+    def _show_license_file(self, title: str, filename: str):
+        """Display a license file in a scrollable dialog."""
+        license_path = os.path.join(basedir, "licenses", filename)
+        try:
+            with open(license_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Could not load license file:\n{e}")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setGeometry(100, 100, 600, 500)
+        layout = QVBoxLayout(dlg)
+
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setPlainText(content)
+        layout.addWidget(text_edit)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn)
+
+        dlg.exec_()
+
+    def show_imagemagick_license(self):
+        """Show the ImageMagick Apache 2.0 license."""
+        self._show_license_file("ImageMagick License", "ImageMagick-LICENSE.txt")
+
+    def show_ghostscript_license(self):
+        """Show the Ghostscript AGPL license."""
+        self._show_license_file("Ghostscript License (AGPL)", "Ghostscript-LICENSE.txt")
+
+#######################################################################################################
+
+    # Removed gifsicle-based optimization methods
+
+    def update_progress(self, file_name, current, total):
+        self.progress_bar.setValue(current)
+        self.label.setText(f"Processing: {file_name} ({current}/{total})")
+
+        # Check if the progress bar has reached the maximum
+        if current == total:
+            # Reset the progress bar
+            self.progress_bar.reset()
+            self.label.setText("Processing complete! You can clear list.")
+
+    def update_file_list(self, full_file_path, file_size):
+        """Show produced file and size.
+        Special handling for multi-page PDFs: if the list still has the base .pdf,
+        and we receive '-1.ext', replace the PDF row with '-1.ext' and insert '-0.ext' as a new row.
+        Otherwise, fall back to matching by exact path or same dir+stem.
+        """
+        out_dir = os.path.dirname(full_file_path)
+        out_name = os.path.basename(full_file_path)
+        out_stem = os.path.splitext(out_name)[0]
+        norm_new = os.path.normcase(os.path.abspath(full_file_path))
+
+        def size_or_default(p: str, default_str: str) -> str:
+            try:
+                sz = os.path.getsize(p)
+                return f"{sz} Bytes ({sz/1024:.2f} KB)"
+            except Exception:
+                return default_str
+
+        def update_or_insert(path: str, size_str: str):
+            """Update first row matching normalized path; remove any duplicates; else append."""
+            norm = os.path.normcase(os.path.abspath(path))
+            first_idx = None
+            to_remove = []
+            for i in range(self.file_list_widget.count()):
+                base = self.file_list_widget.item(i).text().split(" - ", 1)[0]
+                if os.path.normcase(os.path.abspath(base)) == norm:
+                    if first_idx is None:
+                        first_idx = i
+                    else:
+                        to_remove.append(i)
+            # remove duplicates from bottom up
+            for i in reversed(to_remove):
+                self.file_list_widget.takeItem(i)
+            if first_idx is not None:
+                self.file_list_widget.item(first_idx).setText(f"{path} - {size_str}")
+                return
+            # append new
+            self.file_list_widget.addItem(f"{path} - {size_str}")
+            last_item = self.file_list_widget.item(self.file_list_widget.count() - 1)
+            self.file_list_widget.scrollToItem(last_item)
+
+        # Detect page suffix like name-0, name-1
+        m = re.match(r"^(.*)-(\d+)$", out_stem)
+        if m:
+            stem_base = m.group(1)
+            page_idx = int(m.group(2))
+            base_pdf = os.path.join(out_dir, stem_base + ".pdf")
+
+            # Find a row whose basename has same stem and is a PDF (directory-insensitive)
+            pdf_row = None
+            for i in range(self.file_list_widget.count()):
+                base = self.file_list_widget.item(i).text().split(" - ", 1)[0]
+                bname = os.path.basename(base)
+                bstem, bext = os.path.splitext(bname)
+                if bext.lower() == '.pdf' and bstem.lower() == stem_base.lower():
+                    pdf_row = i
+                    break
+
+            if pdf_row is not None:
+                # Replace PDF row with the first arriving page entry. Subsequent pages will be added as new rows.
+                self.file_list_widget.item(pdf_row).setText(f"{full_file_path} - {file_size}")
+                return
+
+        # First, update by normalized path (handles re-runs and existing entries)
+        for index in range(self.file_list_widget.count()):
+            txt = self.file_list_widget.item(index).text()
+            base = txt.split(" - ", 1)[0]
+            if os.path.normcase(os.path.abspath(base)) == norm_new:
+                self.file_list_widget.item(index).setText(f"{full_file_path} - {file_size}")
+                # Remove any other duplicates of the same path
+                for j in range(self.file_list_widget.count() - 1, -1, -1):
+                    if j == index:
+                        continue
+                    b2 = self.file_list_widget.item(j).text().split(" - ", 1)[0]
+                    if os.path.normcase(os.path.abspath(b2)) == norm_new:
+                        self.file_list_widget.takeItem(j)
+                return
+
+        # Next, try to match by same directory and stem (handles src.pdf -> out.jpg)
+        for index in range(self.file_list_widget.count()):
+            txt = self.file_list_widget.item(index).text()
+            base = txt.split(" - ", 1)[0]
+            base_dir = os.path.dirname(base)
+            base_stem = os.path.splitext(os.path.basename(base))[0]
+            if base_dir == out_dir and base_stem == out_stem:
+                self.file_list_widget.item(index).setText(f"{full_file_path} - {file_size}")
+                return
+
+        # If no corresponding row found, append as new (dedupe handled by update_or_insert)
+        update_or_insert(full_file_path, file_size)
+
+    def clear_list(self):
+        self.file_list_widget.clear()
+        self.file_paths = []
+
+        # Close the GIF window if it's open
+        if hasattr(self, 'gif_window') and self.gif_window.isVisible():
+            self.gif_window.close()
+
+        # Reset the flag so the first GIF window will open again for the next batch
+        self.gif_window_opened = False
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = PDFToGIFOptimizer()
+    window.show()
+    sys.exit(app.exec_())

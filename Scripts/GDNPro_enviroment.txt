@@ -1,0 +1,36 @@
+Python version 3.8
+
+python3 -m venv venv
+source venv/bin/activate
+
+pip3 install wheel
+python3 -m pip install --upgrade pip
+
+pip install PyQt5==5.14.0
+pip3 install PyInstaller
+pip3 install pandas
+pip install openpyxl
+
+Then commands to run to create app.py
+
+First run to test app, the create icons insert icons in app
+
+pyinstaller --windowed app.py
+
+
+pyinstaller --windowed --name="GDNPro" --icon="GDNPro.icns" --add-data="icons/add.png:icons" --add-data="icons/delete.png:icons" --add-data="icons/pdf.png:icons" --add-data="icons/film.png:icons" --add-data="icons/gif.png:icons" app.py
+
+Then you can run
+
+pyinstaller "GDNPro.spec"
+
+URL:
+
+
+chmod +x builddmg.sh
+
+./builddmg.sh
+
+
+
+https://www.pythonguis.com/tutorials/packaging-pyqt5-applications-pyinstaller-macos-dmg/

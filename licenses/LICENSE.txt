@@ -1,0 +1,28 @@
+Internal Use License – Inspired Thinking Group
+Version 1.0 – 2026
+
+Copyright (c) 2026 Colin Parsons
+All Rights Reserved.
+
+This software was created and is owned by Colin Parsons.
+
+Inspired Thinking Group (ITG) colleagues are granted a non-exclusive,
+non-transferable, royalty-free license to use, modify, and share this
+application internally within the business.
+
+External distribution, publication, resale, sublicensing, or sharing of this
+software is strictly prohibited without prior written permission from
+Colin Parsons.
+
+Third-Party Components:
+This software includes third-party components provided under their own
+licenses. In the event of any conflict between this license and a third-party
+license, the third-party license terms apply only to that component.
+
+Warranty Disclaimer:
+The software is provided "as-is" without any express or implied warranty.
+The owner and Inspired Thinking Group accept no liability for any damages
+arising from use or inability to use this software.
+
+Governing Law:
+This license is governed by the laws of England and Wales.
