@@ -11,7 +11,7 @@ A fast, portable desktop app (PyQt5) for converting and size-targeting images, b
 - Trim PDFs option leverages TrimBox and geometric trim.
 - Batch friendly: drag-and-drop and folder select.
 - Parallel processing: configurable Workers (1–16, default = min(5, CPU cores)).
-- File renaming with regex patterns and case conversion.
+- File renaming with regex patterns, case conversion, and image orientation detection.
 - QR Code generation from Excel data with multiple output formats (PNG, SVG, TIFF, EPS, PDF).
 - Outputs saved next to source files.
 
@@ -64,6 +64,7 @@ Batch rename files with pattern matching and character replacement.
 - Add Button: opens pattern manager to add/remove/reset regex patterns.
 - Replace/With: simple character replacement (e.g., replace spaces with underscores).
 - Case Conversion: Default, Capitals, Title, Lowercase.
+- **Add Orientation (L/P/S)**: detect image dimensions and append L (Landscape), P (Portrait), or S (Square) as prefix or suffix.
 - Export to .txt: export the rename list to a text file.
 - Process: apply all renaming operations.
 
@@ -205,7 +206,7 @@ Notes:
 ## Settings Persistence
 The app uses an SQLite database (`config/database.db`) to persist settings:
 - Image tab: output format, resolution, tolerance, workers, timeout, trim PDFs, target KB.
-- Rename tab: enable illegal chars, replace/with characters, case setting, custom patterns.
+- Rename tab: enable illegal chars, replace/with characters, case setting, **orientation detection**, custom patterns.
 - QR Code tab: output format, size, border, error correction, colors, output directory.
 
 ## Error Handling & Logging
@@ -229,6 +230,8 @@ The app uses an SQLite database (`config/database.db`) to persist settings:
   - A: No. The app uses only the bundled ImageMagick `convert`.
 - Q: How do I add custom rename patterns?
   - A: Go to the Rename tab, click "Add" next to "Enable Illegal Chars and Patterns" to open the pattern manager.
+- Q: What does the "Add Orientation" option do?
+  - A: When enabled, it detects each image's dimensions and adds L (Landscape), P (Portrait), or S (Square) to the filename as either a prefix or suffix.
 - Q: What Excel format does the QR Code tab need?
   - A: Excel files should have columns named `name` (filename) and `url` (QR code data).
 

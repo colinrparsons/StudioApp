@@ -1324,15 +1324,29 @@ class PDFToGIFOptimizer(QMainWindow):
 
     def show_about(self):
         text = (
-            "Image Converter\n\n"
-            "A portable PyQt5 app that converts PDF/JPG/PNG/GIF to JPG/PNG/GIF using a bundled ImageMagick.\n\n"
-            "This application is for internal company use only.\n\n"
-            "Features:\n"
-            " • Target size with tolerance\n"
-            " • Multi-page PDF handling.\n"
-            " • Trim PDFs option and resolution presets\n"
-            " • Parallel processing with progress updates\n\n"
-            "Copyright © 2026 Colin Parsons"
+        "Image Converter\n\n"
+        "A portable PyQt5 application that converts PDF/JPG/PNG/GIF files to "
+        "JPG/PNG/GIF using a bundled ImageMagick engine.\n\n"
+
+        "This software was created and is owned by Colin Parsons. Inspired Thinking "
+        "Group (ITG) colleagues are permitted to use, modify, and share this "
+        "application internally within the business.\n\n"
+
+        "External distribution, publication, or sharing is strictly prohibited "
+        "without prior written permission from Colin Parsons.\n\n"
+
+        "The software is provided “as‑is” without any express or implied warranty. "
+        "Neither the author nor Inspired Thinking Group shall be liable for any "
+        "resulting damages.\n\n"
+
+        "Features:\n"
+        " • Target size with tolerance\n"
+        " • Multi‑page PDF handling\n"
+        " • Trim PDF option and resolution presets\n"
+        " • Parallel processing with progress updates\n\n"
+
+        "Copyright © 2026 Colin Parsons\n"
+        "Version: 1.0.0"
         )
         QMessageBox.about(self, "About Image Converter", text)
 

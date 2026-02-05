@@ -6,6 +6,7 @@ Contains the RenamerTab and PatternsDialog classes for the Rename tab functional
 import os
 import re
 import sqlite3
+from PIL import Image
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget, 
     QFileDialog, QLabel, QLineEdit, QComboBox, QCheckBox, 
@@ -67,6 +68,18 @@ class RenamerTab(QWidget):
         button_layout.addWidget(QLabel("Case Conversion:"))
         button_layout.addWidget(self.case_dropdown)
 
+        # Orientation checkbox and position dropdown
+        self.enable_orientation = QCheckBox("Add Orientation (L/P/S)")
+        self.enable_orientation.setChecked(False)
+        self.enable_orientation.stateChanged.connect(self.on_orientation_enabled_changed)
+        button_layout.addWidget(self.enable_orientation)
+
+        self.orientation_position = QComboBox()
+        self.orientation_position.addItems(["Suffix", "Prefix"])
+        self.orientation_position.setEnabled(False)
+        self.orientation_position.currentTextChanged.connect(self.on_orientation_position_changed)
+        button_layout.addWidget(self.orientation_position)
+
         # Buttons
         self.select_folder_button = QPushButton("Select Folder")
         self.select_folder_button.clicked.connect(self.select_folder)
@@ -106,11 +119,11 @@ class RenamerTab(QWidget):
         self.previewed_names = []
         for file_path in self.file_paths:
             original_filename = os.path.basename(file_path)
-            cleaned_filename = self.preview_filename(original_filename)
+            cleaned_filename = self.preview_filename(file_path, original_filename)
             self.file_list.addItem(f"{original_filename} -> {cleaned_filename}")
             self.previewed_names.append(cleaned_filename)
 
-    def preview_filename(self, filename):
+    def preview_filename(self, file_path, filename):
         """Generate a preview of the new file name."""
         name, ext = os.path.splitext(filename)
 
@@ -123,7 +136,7 @@ class RenamerTab(QWidget):
         # Apply illegal characters and patterns (if enabled)
         if self.enable_illegal_chars.isChecked():
             # Remove illegal chars but keep underscore and dash
-            name = re.sub(r'[()+<>&|;"/\\,!{@}£$^#€™|?*]', '', name)
+            name = re.sub(r'[()+<>&|;"/\,!{@}£$^#€™|?*]', '', name)
             # Load and apply patterns from database
             patterns = self.load_patterns_from_db()
             for pattern, replacement in patterns:
@@ -141,7 +154,38 @@ class RenamerTab(QWidget):
         elif case_option == "Lowercase":
             name = name.lower()
 
+        # Apply orientation (if enabled)
+        if self.enable_orientation.isChecked():
+            orientation = self.get_image_orientation(file_path)
+            if orientation:
+                # Strip any existing orientation markers to prevent duplicates
+                name = re.sub(r'(^[LPS]_)', '', name)  # Prefix patterns: L_, P_, S_
+                name = re.sub(r'(_[LPS]$)', '', name)  # Suffix patterns: _L, _P, _S
+                name = re.sub(r'_[LPS]_', '_', name)  # Middle patterns: _L_, _P_, _S_
+                name = re.sub(r'_+', '_', name)  # Clean up any double underscores
+                name = name.strip('_')  # Remove leading/trailing underscores
+                
+                position = self.orientation_position.currentText()
+                if position == "Prefix":
+                    name = f"{orientation}_{name}"
+                else:  # Suffix
+                    name = f"{name}_{orientation}"
+
         return name + ext
+
+    def get_image_orientation(self, file_path):
+        """Detect image orientation from file dimensions. Returns 'L', 'P', 'S', or None."""
+        try:
+            with Image.open(file_path) as img:
+                width, height = img.size
+                if width > height:
+                    return 'L'  # Landscape
+                elif height > width:
+                    return 'P'  # Portrait
+                else:
+                    return 'S'  # Square
+        except Exception:
+            return None  # Not an image or error reading file
 
     def process_files(self):
         """Rename files based on the previewed names."""
@@ -211,6 +255,17 @@ class RenamerTab(QWidget):
         self.save_setting('case', self.case_dropdown.currentText())
         self.update_preview()
 
+    def on_orientation_enabled_changed(self):
+        """Handle orientation checkbox change."""
+        self.save_setting('enable_orientation', '1' if self.enable_orientation.isChecked() else '0')
+        self.orientation_position.setEnabled(self.enable_orientation.isChecked())
+        self.update_preview()
+
+    def on_orientation_position_changed(self):
+        """Handle orientation position dropdown change."""
+        self.save_setting('orientation_position', self.orientation_position.currentText())
+        self.update_preview()
+
     def load_settings_from_db(self):
         """Load saved settings from the database."""
         try:
@@ -229,6 +284,11 @@ class RenamerTab(QWidget):
                 self.with_char_field.setText(settings['renamer_with_char'])
             if 'renamer_case' in settings:
                 self.case_dropdown.setCurrentText(settings['renamer_case'])
+            if 'renamer_enable_orientation' in settings:
+                self.enable_orientation.setChecked(settings['renamer_enable_orientation'] == '1')
+                self.orientation_position.setEnabled(settings['renamer_enable_orientation'] == '1')
+            if 'renamer_orientation_position' in settings:
+                self.orientation_position.setCurrentText(settings['renamer_orientation_position'])
         except Exception:
             pass  # Use defaults if DB fails
 
